@@ -1,95 +1,206 @@
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const N: usize = 256; // byte alphabet size (0..=255)
+// ============================================================================
+// WORD-LEVEL BIGRAM MODEL
+// ============================================================================
+//
+// A bigram model predicts the next token based ONLY on the previous token.
+// It's the simplest form of a language model.
+//
+// KEY CONCEPTS:
+//
+// 1. TOKENIZATION: We split text into words (tokens). Each unique word gets
+//    an integer ID for efficient storage and lookup.
+//
+// 2. BIGRAM COUNTS: We count how often each word follows another word.
+//    For example, in "the cat sat on the mat":
+//      - "the" is followed by "cat" once and "mat" once
+//      - "cat" is followed by "sat" once
+//      - etc.
+//
+// 3. PROBABILITY: To predict the next word after "the", we look at all words
+//    that ever followed "the" and sample proportionally to their counts.
+//    P(next | prev) = count(prev, next) / sum of all counts for prev
+//
+// 4. GENERATION: Start with a seed word, repeatedly sample the next word
+//    using the learned probabilities.
+//
+// LIMITATIONS:
+// - Only considers ONE previous word (no long-range context)
+// - Can't handle words it hasn't seen before (out-of-vocabulary)
+// - Generated text often lacks coherence beyond 2-word phrases
+//
+// ============================================================================
 
 fn main() {
-    // Training text from training.txt
-    let text = std::fs::read_to_string("src/bin/training.txt").expect("Failed to read training.txt");
+    // Load training text
+    let text = std::fs::read_to_string("src/bin/training.txt")
+        .expect("Failed to read training.txt");
 
-    // 1) Train bigram counts: counts[prev][next] += 1
-    let counts = train_bigrams(text.as_bytes());
+    // Build vocabulary and train the word-level bigram model
+    let (vocab, inv_vocab, counts) = train_word_bigrams(&text);
 
-    // 2) Generate text
+    println!("Vocabulary size: {} words", vocab.len());
+    println!();
+
+    // Generate text
     let seed = time_seed();
     let mut rng = Rng::new(seed);
 
-    let start = b'R';
-    let generated = generate(&counts, start, 400, &mut rng);
+    // Pick a random starting word from vocabulary
+    let start_word = "The";
+    let start_id = vocab.get(start_word).copied().unwrap_or(0);
 
-    println!("--- Generated ---");
-    println!("{}", String::from_utf8_lossy(&generated));
+    let generated_ids = generate_words(&counts, start_id, 5000, &mut rng);
+    let generated_text: Vec<&str> = generated_ids
+        .iter()
+        .map(|&id| inv_vocab[id].as_str())
+        .collect();
+
+    println!("--- Generated (Word-Level Bigram) ---");
+    println!("{}", generated_text.join(" "));
 }
 
-// ---------------------------
-// Training
-// ---------------------------
+// ============================================================================
+// VOCABULARY BUILDING
+// ============================================================================
+//
+// We need to map words <-> integers because:
+// 1. Integers are faster to compare and use as array indices
+// 2. We can use a 2D array/matrix for efficient count storage
+//
+// vocab: word -> id (for encoding)
+// inv_vocab: id -> word (for decoding back to text)
 
-fn train_bigrams(data: &[u8]) -> [[u32; N]; N] {
-    let mut counts = [[0u32; N]; N];
+fn build_vocabulary(text: &str) -> (HashMap<String, usize>, Vec<String>) {
+    let mut vocab: HashMap<String, usize> = HashMap::new();
+    let mut inv_vocab: Vec<String> = Vec::new();
 
-    if data.len() < 2 {
-        return counts;
+    for word in text.split_whitespace() {
+        if !vocab.contains_key(word) {
+            let id = inv_vocab.len();
+            vocab.insert(word.to_string(), id);
+            inv_vocab.push(word.to_string());
+        }
     }
 
-    for i in 0..(data.len() - 1) {
-        let prev = data[i] as usize;
-        let next = data[i + 1] as usize;
-        counts[prev][next] += 1;
-    }
-
-    counts
+    (vocab, inv_vocab)
 }
 
-// ---------------------------
-// Generation
-// ---------------------------
+// ============================================================================
+// TRAINING: Count bigrams
+// ============================================================================
+//
+// For each consecutive pair of words (w1, w2), increment counts[w1_id][w2_id].
+// This builds a sparse matrix of transition counts.
+//
+// Example: "I like cats I like dogs"
+//   Words: ["I", "like", "cats", "I", "like", "dogs"]
+//   IDs:   [0, 1, 2, 0, 1, 3]
+//   Bigrams: (0,1), (1,2), (2,0), (0,1), (1,3)
+//   
+//   counts[0][1] = 2  (I -> like appears twice)
+//   counts[1][2] = 1  (like -> cats)
+//   counts[1][3] = 1  (like -> dogs)
+//   counts[2][0] = 1  (cats -> I)
 
-fn generate(counts: &[[u32; N]; N], start: u8, length: usize, rng: &mut Rng) -> Vec<u8> {
+fn train_word_bigrams(text: &str) -> (HashMap<String, usize>, Vec<String>, HashMap<usize, HashMap<usize, u32>>) {
+    let (vocab, inv_vocab) = build_vocabulary(text);
+
+    // Sparse storage: HashMap<prev_id, HashMap<next_id, count>>
+    // More memory-efficient than a dense VxV matrix for large vocabularies
+    let mut counts: HashMap<usize, HashMap<usize, u32>> = HashMap::new();
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+
+    if words.len() < 2 {
+        return (vocab, inv_vocab, counts);
+    }
+
+    // Count all bigrams
+    for i in 0..(words.len() - 1) {
+        let prev_id = vocab[words[i]];
+        let next_id = vocab[words[i + 1]];
+
+        *counts
+            .entry(prev_id)
+            .or_insert_with(HashMap::new)
+            .entry(next_id)
+            .or_insert(0) += 1;
+    }
+
+    (vocab, inv_vocab, counts)
+}
+
+// ============================================================================
+// GENERATION: Sample from learned distribution
+// ============================================================================
+//
+// Given the current word's ID, look up which words followed it during training.
+// Sample the next word proportionally to the counts (weighted random selection).
+//
+// This is essentially sampling from P(next | prev) = count(prev,next) / total
+
+fn generate_words(
+    counts: &HashMap<usize, HashMap<usize, u32>>,
+    start_id: usize,
+    length: usize,
+    rng: &mut Rng,
+) -> Vec<usize> {
     let mut out = Vec::with_capacity(length + 1);
-    out.push(start);
+    out.push(start_id);
 
-    let mut prev = start;
+    let mut prev_id = start_id;
 
     for _ in 0..length {
-        let next = sample_next(counts, prev, rng);
-        out.push(next);
-        prev = next;
+        let next_id = sample_next_word(counts, prev_id, rng);
+        out.push(next_id);
+        prev_id = next_id;
     }
 
     out
 }
 
-fn sample_next(counts: &[[u32; N]; N], prev: u8, rng: &mut Rng) -> u8 {
-    let row = &counts[prev as usize];
+fn sample_next_word(
+    counts: &HashMap<usize, HashMap<usize, u32>>,
+    prev_id: usize,
+    rng: &mut Rng,
+) -> usize {
+    // Get the distribution of words that follow prev_id
+    let Some(next_counts) = counts.get(&prev_id) else {
+        // Never seen this word - fall back to word 0
+        return 0;
+    };
 
-    // Only sum counts that actually appeared (no +1 smoothing across all 256 bytes), known as Laplacian smoothing
-    let total: u64 = row.iter().map(|&c| c as u64).sum();
+    // Sum all counts to get the total "probability mass"
+    let total: u64 = next_counts.values().map(|&c| c as u64).sum();
 
-    // If we've never seen this character before, fall back to a space or newline
     if total == 0 {
-        return b' ';
+        return 0;
     }
 
-    // Pick a random number in [0, total)
+    // Pick a random point in [0, total)
     let mut r = rng.next_u64() % total;
 
-    // Walk through weights until we land somewhere
-    for (i, &c) in row.iter().enumerate() {
-        if c == 0 {
-            continue;
-        }
-        let w = c as u64;
+    // Walk through the distribution until we land on a word
+    // This is "roulette wheel" selection - words with higher counts
+    // occupy more of the wheel and are more likely to be selected
+    for (&next_id, &count) in next_counts {
+        let w = count as u64;
         if r < w {
-            return i as u8;
+            return next_id;
         }
         r -= w;
     }
 
-    // Fallback (shouldn't happen)
-    b' '
+    // Fallback (shouldn't happen if counts are correct)
+    0
 }
 
-// Tiny RNG (so we don't need rand crate)
+// ============================================================================
+// UTILITIES
+// ============================================================================
 
 struct Rng {
     state: u64,
@@ -97,13 +208,12 @@ struct Rng {
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        // Avoid seed=0 getting stuck in some RNGs
         let s = if seed == 0 { 0xdead_beef_cafe_f00d } else { seed };
         Self { state: s }
     }
 
     fn next_u64(&mut self) -> u64 {
-        // xorshift64: small, simple, decent for demos
+        // xorshift64: simple and fast PRNG
         let mut x = self.state;
         x ^= x << 13;
         x ^= x >> 7;
