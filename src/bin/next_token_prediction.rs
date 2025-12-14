@@ -1,148 +1,252 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// ============================================================================
-// WORD-LEVEL BIGRAM MODEL
-// ============================================================================
-//
-// A bigram model predicts the next token based ONLY on the previous token.
-// It's the simplest form of a language model.
-//
-// KEY CONCEPTS:
-//
-// 1. TOKENIZATION: We split text into words (tokens). Each unique word gets
-//    an integer ID for efficient storage and lookup.
-//
-// 2. BIGRAM COUNTS: We count how often each word follows another word.
-//    For example, in "the cat sat on the mat":
-//      - "the" is followed by "cat" once and "mat" once
-//      - "cat" is followed by "sat" once
-//      - etc.
-//
-// 3. PROBABILITY: To predict the next word after "the", we look at all words
-//    that ever followed "the" and sample proportionally to their counts.
-//    P(next | prev) = count(prev, next) / sum of all counts for prev
-//
-// 4. GENERATION: Start with a seed word, repeatedly sample the next word
-//    using the learned probabilities.
-//
-// LIMITATIONS:
-// - Only considers ONE previous word (no long-range context)
-// - Can't handle words it hasn't seen before (out-of-vocabulary)
-// - Generated text often lacks coherence beyond 2-word phrases
-//
-// ============================================================================
-
 fn main() {
     // Load training text
-    let text = std::fs::read_to_string("src/bin/training.txt")
-        .expect("Failed to read training.txt");
+    let text =
+        std::fs::read_to_string("src/bin/training.txt").expect("Failed to read training.txt");
 
-    // Build vocabulary and train the word-level bigram model
-    let (vocab, inv_vocab, counts) = train_word_bigrams(&text);
-
-    println!("Vocabulary size: {} words", vocab.len());
+    let seed = time_seed();
+    
+    // ========================================
+    // Method 1: Pure character-level bigrams
+    // ========================================
+    println!("=== Method 1: Character-level Bigrams ===");
+    println!("Text length: {} bytes/characters", text.len());
+    
+    let char_tokens: Vec<usize> = text.as_bytes().iter().map(|&b| b as usize).collect();
+    let char_counts = train_token_bigrams(&char_tokens);
+    
+    let mut rng1 = Rng::new(seed);
+    let start_char = b'T' as usize;
+    let char_generated = generate_bigram_tokens(&char_counts, start_char, 500, &mut rng1);
+    let char_text: String = char_generated.iter().map(|&id| id as u8 as char).collect();
+    
+    println!("--- Generated (Character Bigrams) ---");
+    println!("{}", char_text);
     println!();
 
-    // Generate text
-    let seed = time_seed();
-    let mut rng = Rng::new(seed);
+    // ========================================
+    // Method 2: BPE tokenizer + TRIGRAMS
+    // ========================================
+    println!("=== Method 2: BPE Tokenizer + Trigrams ===");
+    println!("Training BPE tokenizer...");
 
-    // Pick a random starting word from vocabulary
-    let start_word = "The";
-    let start_id = vocab.get(start_word).copied().unwrap_or(0);
+    // With trigrams, we can use more merges since we have
+    // more context to disambiguate
+    let num_merges = 300;
+    let tokenizer = BpeTokenizer::train(&text, num_merges);
 
-    let generated_ids = generate_words(&counts, start_id, 5000, &mut rng);
-    let generated_text: Vec<&str> = generated_ids
-        .iter()
-        .map(|&id| inv_vocab[id].as_str())
-        .collect();
+    println!("Vocabulary size: {} tokens", tokenizer.vocab_size());
+    println!();
 
-    println!("--- Generated (Word-Level Bigram) ---");
-    println!("{}", generated_text.join(" "));
+    // Show some example tokens
+    println!("Sample learned tokens:");
+    for (i, token) in tokenizer.inv_vocab.iter().enumerate().skip(256).take(20) {
+        println!("  Token {}: {:?}", i, String::from_utf8_lossy(token));
+    }
+    println!();
+
+    // Tokenize the training text
+    let token_ids = tokenizer.encode(&text);
+    println!(
+        "Compression: {} bytes -> {} tokens ({:.1}x)",
+        text.len(),
+        token_ids.len(),
+        text.len() as f64 / token_ids.len() as f64
+    );
+    println!();
+
+    // Train TRIGRAM model on tokens (looks at previous 2 tokens)
+    let trigram_counts = train_token_trigrams(&token_ids);
+    println!("Trigram contexts learned: {}", trigram_counts.len());
+    println!();
+
+    // Generate text using trigrams
+    let mut rng2 = Rng::new(seed);
+
+    // Start with "The " tokens
+    let start_text = "The ";
+    let start_ids = tokenizer.encode(start_text);
+    let (ctx1, ctx2) = if start_ids.len() >= 2 {
+        (start_ids[start_ids.len() - 2], start_ids[start_ids.len() - 1])
+    } else if start_ids.len() == 1 {
+        (b' ' as usize, start_ids[0])
+    } else {
+        (b' ' as usize, b'T' as usize)
+    };
+
+    let generated_ids = generate_trigram_tokens(&trigram_counts, ctx1, ctx2, 200, &mut rng2);
+    let generated_text = tokenizer.decode(&generated_ids);
+
+    println!("--- Generated (BPE Tokenizer + Trigram) ---");
+    println!("{}", generated_text);
 }
 
 // ============================================================================
-// VOCABULARY BUILDING
+// BPE TOKENIZER
 // ============================================================================
-//
-// We need to map words <-> integers because:
-// 1. Integers are faster to compare and use as array indices
-// 2. We can use a 2D array/matrix for efficient count storage
-//
-// vocab: word -> id (for encoding)
-// inv_vocab: id -> word (for decoding back to text)
 
-fn build_vocabulary(text: &str) -> (HashMap<String, usize>, Vec<String>) {
-    let mut vocab: HashMap<String, usize> = HashMap::new();
-    let mut inv_vocab: Vec<String> = Vec::new();
+struct BpeTokenizer {
+    // Merge rules: (token1, token2) -> merged_token_id
+    // Applied in order during encoding
+    merges: Vec<((usize, usize), usize)>,
 
-    for word in text.split_whitespace() {
-        if !vocab.contains_key(word) {
-            let id = inv_vocab.len();
-            vocab.insert(word.to_string(), id);
-            inv_vocab.push(word.to_string());
+    // Vocabulary: token_id -> byte sequence
+    inv_vocab: Vec<Vec<u8>>,
+
+    // Reverse lookup: byte sequence -> token_id (for encoding)
+    vocab: HashMap<Vec<u8>, usize>,
+}
+
+impl BpeTokenizer {
+    /// Train a BPE tokenizer on the given text
+    fn train(text: &str, num_merges: usize) -> Self {
+        let bytes = text.as_bytes();
+
+        // Initialize vocabulary with all 256 possible bytes
+        let mut inv_vocab: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
+        let mut vocab: HashMap<Vec<u8>, usize> =
+            inv_vocab.iter().cloned().enumerate().map(|(i, v)| (v, i)).collect();
+
+        // Current tokenization of the text (start as individual bytes)
+        let mut tokens: Vec<usize> = bytes.iter().map(|&b| b as usize).collect();
+
+        let mut merges: Vec<((usize, usize), usize)> = Vec::with_capacity(num_merges);
+
+        for i in 0..num_merges {
+            if tokens.len() < 2 {
+                break;
+            }
+
+            // Count all adjacent pairs
+            let pair_counts = count_pairs(&tokens);
+
+            // Find the most frequent pair
+            let Some((best_pair, count)) = pair_counts.iter().max_by_key(|(_, c)| *c) else {
+                break;
+            };
+
+            if *count < 2 {
+                // No pair appears more than once, stop
+                break;
+            }
+
+            // Create new token by concatenating the pair
+            let (t1, t2) = *best_pair;
+            let mut new_token = inv_vocab[t1].clone();
+            new_token.extend(&inv_vocab[t2]);
+
+            let new_id = inv_vocab.len();
+            inv_vocab.push(new_token.clone());
+            vocab.insert(new_token, new_id);
+            merges.push((*best_pair, new_id));
+
+            // Replace all occurrences of the pair with the new token
+            tokens = merge_pair(&tokens, *best_pair, new_id);
+
+            if (i + 1) % 100 == 0 {
+                println!(
+                    "  Merge {}/{}: {:?} + {:?} -> token {} (count: {})",
+                    i + 1,
+                    num_merges,
+                    String::from_utf8_lossy(&inv_vocab[t1]),
+                    String::from_utf8_lossy(&inv_vocab[t2]),
+                    new_id,
+                    count
+                );
+            }
+        }
+
+        Self { merges, inv_vocab, vocab }
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.inv_vocab.len()
+    }
+
+    /// Encode text into token IDs
+    fn encode(&self, text: &str) -> Vec<usize> {
+        // Start with bytes
+        let mut tokens: Vec<usize> = text.as_bytes().iter().map(|&b| b as usize).collect();
+
+        // Apply merges in order (greedy)
+        for &(pair, new_id) in &self.merges {
+            tokens = merge_pair(&tokens, pair, new_id);
+        }
+
+        tokens
+    }
+
+    /// Decode token IDs back to text
+    fn decode(&self, tokens: &[usize]) -> String {
+        let bytes: Vec<u8> = tokens
+            .iter()
+            .filter_map(|&id| self.inv_vocab.get(id))
+            .flatten()
+            .copied()
+            .collect();
+
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Count all adjacent pairs in the token sequence
+fn count_pairs(tokens: &[usize]) -> HashMap<(usize, usize), u32> {
+    let mut counts = HashMap::new();
+
+    for window in tokens.windows(2) {
+        let pair = (window[0], window[1]);
+        *counts.entry(pair).or_insert(0) += 1;
+    }
+
+    counts
+}
+
+/// Replace all occurrences of `pair` with `new_id`
+fn merge_pair(tokens: &[usize], pair: (usize, usize), new_id: usize) -> Vec<usize> {
+    let mut result = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+
+    while i < tokens.len() {
+        if i + 1 < tokens.len() && tokens[i] == pair.0 && tokens[i + 1] == pair.1 {
+            result.push(new_id);
+            i += 2;
+        } else {
+            result.push(tokens[i]);
+            i += 1;
         }
     }
 
-    (vocab, inv_vocab)
+    result
 }
 
 // ============================================================================
-// TRAINING: Count bigrams
+// BIGRAM MODEL ON TOKENS
 // ============================================================================
-//
-// For each consecutive pair of words (w1, w2), increment counts[w1_id][w2_id].
-// This builds a sparse matrix of transition counts.
-//
-// Example: "I like cats I like dogs"
-//   Words: ["I", "like", "cats", "I", "like", "dogs"]
-//   IDs:   [0, 1, 2, 0, 1, 3]
-//   Bigrams: (0,1), (1,2), (2,0), (0,1), (1,3)
-//   
-//   counts[0][1] = 2  (I -> like appears twice)
-//   counts[1][2] = 1  (like -> cats)
-//   counts[1][3] = 1  (like -> dogs)
-//   counts[2][0] = 1  (cats -> I)
 
-fn train_word_bigrams(text: &str) -> (HashMap<String, usize>, Vec<String>, HashMap<usize, HashMap<usize, u32>>) {
-    let (vocab, inv_vocab) = build_vocabulary(text);
-
-    // Sparse storage: HashMap<prev_id, HashMap<next_id, count>>
-    // More memory-efficient than a dense VxV matrix for large vocabularies
+fn train_token_bigrams(tokens: &[usize]) -> HashMap<usize, HashMap<usize, u32>> {
     let mut counts: HashMap<usize, HashMap<usize, u32>> = HashMap::new();
 
-    let words: Vec<&str> = text.split_whitespace().collect();
-
-    if words.len() < 2 {
-        return (vocab, inv_vocab, counts);
+    if tokens.len() < 2 {
+        return counts;
     }
 
-    // Count all bigrams
-    for i in 0..(words.len() - 1) {
-        let prev_id = vocab[words[i]];
-        let next_id = vocab[words[i + 1]];
+    for window in tokens.windows(2) {
+        let prev_id = window[0];
+        let next_id = window[1];
 
         *counts
             .entry(prev_id)
-            .or_insert_with(HashMap::new)
+            .or_default()
             .entry(next_id)
             .or_insert(0) += 1;
     }
 
-    (vocab, inv_vocab, counts)
+    counts
 }
 
-// ============================================================================
-// GENERATION: Sample from learned distribution
-// ============================================================================
-//
-// Given the current word's ID, look up which words followed it during training.
-// Sample the next word proportionally to the counts (weighted random selection).
-//
-// This is essentially sampling from P(next | prev) = count(prev,next) / total
-
-fn generate_words(
+fn generate_bigram_tokens(
     counts: &HashMap<usize, HashMap<usize, u32>>,
     start_id: usize,
     length: usize,
@@ -154,7 +258,7 @@ fn generate_words(
     let mut prev_id = start_id;
 
     for _ in 0..length {
-        let next_id = sample_next_word(counts, prev_id, rng);
+        let next_id = sample_bigram_token(counts, prev_id, rng);
         out.push(next_id);
         prev_id = next_id;
     }
@@ -162,40 +266,106 @@ fn generate_words(
     out
 }
 
-fn sample_next_word(
+fn sample_bigram_token(
     counts: &HashMap<usize, HashMap<usize, u32>>,
     prev_id: usize,
     rng: &mut Rng,
 ) -> usize {
-    // Get the distribution of words that follow prev_id
     let Some(next_counts) = counts.get(&prev_id) else {
-        // Never seen this word - fall back to word 0
-        return 0;
+        return b' ' as usize;
     };
 
-    // Sum all counts to get the total "probability mass"
     let total: u64 = next_counts.values().map(|&c| c as u64).sum();
-
     if total == 0 {
-        return 0;
+        return b' ' as usize;
     }
 
-    // Pick a random point in [0, total)
     let mut r = rng.next_u64() % total;
-
-    // Walk through the distribution until we land on a word
-    // This is "roulette wheel" selection - words with higher counts
-    // occupy more of the wheel and are more likely to be selected
     for (&next_id, &count) in next_counts {
-        let w = count as u64;
-        if r < w {
+        if r < count as u64 {
             return next_id;
         }
-        r -= w;
+        r -= count as u64;
+    }
+    b' ' as usize
+}
+
+// ============================================================================
+// TRIGRAM MODEL ON TOKENS
+// ============================================================================
+
+/// Train trigram model: (token_i-2, token_i-1) -> token_i
+fn train_token_trigrams(tokens: &[usize]) -> HashMap<(usize, usize), HashMap<usize, u32>> {
+    let mut counts: HashMap<(usize, usize), HashMap<usize, u32>> = HashMap::new();
+
+    if tokens.len() < 3 {
+        return counts;
     }
 
-    // Fallback (shouldn't happen if counts are correct)
-    0
+    for window in tokens.windows(3) {
+        let ctx = (window[0], window[1]);
+        let next_id = window[2];
+
+        *counts
+            .entry(ctx)
+            .or_default()
+            .entry(next_id)
+            .or_insert(0) += 1;
+    }
+
+    counts
+}
+
+fn generate_trigram_tokens(
+    counts: &HashMap<(usize, usize), HashMap<usize, u32>>,
+    ctx1: usize,
+    ctx2: usize,
+    length: usize,
+    rng: &mut Rng,
+) -> Vec<usize> {
+    let mut out = Vec::with_capacity(length + 2);
+    out.push(ctx1);
+    out.push(ctx2);
+
+    let mut prev1 = ctx1;
+    let mut prev2 = ctx2;
+
+    for _ in 0..length {
+        let next_id = sample_trigram_token(counts, prev1, prev2, rng);
+        out.push(next_id);
+        prev1 = prev2;
+        prev2 = next_id;
+    }
+
+    out
+}
+
+fn sample_trigram_token(
+    counts: &HashMap<(usize, usize), HashMap<usize, u32>>,
+    prev1: usize,
+    prev2: usize,
+    rng: &mut Rng,
+) -> usize {
+    let ctx = (prev1, prev2);
+    
+    let Some(next_counts) = counts.get(&ctx) else {
+        // Fallback: return space
+        return b' ' as usize;
+    };
+
+    let total: u64 = next_counts.values().map(|&c| c as u64).sum();
+    if total == 0 {
+        return b' ' as usize;
+    }
+
+    let mut r = rng.next_u64() % total;
+    for (&next_id, &count) in next_counts {
+        if r < count as u64 {
+            return next_id;
+        }
+        r -= count as u64;
+    }
+    b' ' as usize
 }
 
 // ============================================================================
@@ -208,12 +378,15 @@ struct Rng {
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        let s = if seed == 0 { 0xdead_beef_cafe_f00d } else { seed };
+        let s = if seed == 0 {
+            0xdead_beef_cafe_f00d
+        } else {
+            seed
+        };
         Self { state: s }
     }
 
     fn next_u64(&mut self) -> u64 {
-        // xorshift64: simple and fast PRNG
         let mut x = self.state;
         x ^= x << 13;
         x ^= x >> 7;
